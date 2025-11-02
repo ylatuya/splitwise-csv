@@ -193,12 +193,14 @@ class FileSettings:
         desc_col: Optional[int] = None,
         local_currency: Currency = Currency.EUR,
         has_title_row: Optional[bool] = None,
+        include_col: Optional[int] = None,
     ) -> None:
         self.date_col = date_col
         self.amount_col = amount_col
         self.desc_col = desc_col
         self.has_title_row = has_title_row
         self.local_currency = local_currency
+        self.include_col = include_col
 
 
 class Settings:
@@ -206,6 +208,15 @@ class Settings:
         self.remember = False
         self.newest_transaction = ""
         self.settings_file = os.path.join(appdirs.user_data_dir("splitwise-csv"), "csv_settings.pkl")
+
+        # default fields for loaded settings
+        self.loaded = False
+        self.date_col: Optional[int] = None
+        self.amount_col: Optional[int] = None
+        self.desc_col: Optional[int] = None
+        self.has_title_row: Optional[bool] = None
+        self.local_currency: Optional[Currency] = None
+        self.include_col: Optional[int] = None
 
         # Load settings if they exist
         if os.path.isfile(self.settings_file):
@@ -225,6 +236,12 @@ class Settings:
         file_settings.amount_col = int(input("Which column has the amount?"))
         file_settings.desc_col = int(input("Which column has the description?"))
         file_settings.has_title_row = input("Does the first row have titles? [Y/n]").lower() != "n"
+        # Ask whether there is a dedicated include/skip column
+        has_include = input("Is there a column that indicates whether a row should be included? [y/N] ").lower() == "y"
+        if has_include:
+            file_settings.include_col = int(input("Which column index contains the include flag? (start at 0) "))
+        else:
+            file_settings.include_col = None
         while True:
             try:
                 currency_code = input("What currency were these transactions made in? (e.g., USD, EUR): ").upper()
@@ -237,7 +254,13 @@ class Settings:
             else:
                 break
         self.remember = input("Remember these settings? [Y/n]").lower() != "n"
-        breakpoint()
+        # copy chosen file settings into persistent settings object
+        self.date_col = file_settings.date_col
+        self.amount_col = file_settings.amount_col
+        self.desc_col = file_settings.desc_col
+        self.has_title_row = file_settings.has_title_row
+        self.include_col = file_settings.include_col
+        self.loaded = True
         self.save()
 
     def save(self) -> None:
@@ -257,13 +280,15 @@ class Settings:
 
 
 class Expense:
-    def __init__(self, date: str, concept: str, amount: Money) -> None:
+    def __init__(self, date: str, concept: str, amount: Money, include: Optional[bool] = None) -> None:
         self.date = date
         self.concept = concept
         self.amount = amount
+        # include: True => always include, False => always skip, None => ask
+        self.include = include
 
     def __repr__(self) -> str:
-        return f"Expense(date={self.date}, concept={self.concept}, amount={self.amount})"
+        return f"Expense(date={self.date}, concept={self.concept}, amount={self.amount}, include={self.include})"
 
 
 class FileParser(ABC):
@@ -347,6 +372,10 @@ class CSVFileParser(FileParser):
         """Parse concept/description from CSV row. Can be overridden by subclasses."""
         return concept.strip()
 
+    def parse_include(self, include: str) -> bool:
+        """Parse include flag from CSV row. Can be overridden by subclasses."""
+        return include.strip().lower() in ("1", "true", "t", "yes", "y")
+
     def parse(self, settings: Settings, file_path: str) -> List[Expense]:
         expenses = []
         delimiter = self._detect_delimiter(file_path)
@@ -370,7 +399,9 @@ class CSVFileParser(FileParser):
                     normalized_amount = self.normalize_amount(row[self.settings.amount_col], decimal_sep)
                     amount = self.parse_amount(normalized_amount)
                     concept = self.parse_concept(row[self.settings.desc_col])
-                    expenses.append(Expense(date, concept, amount))
+                    if self.settings.include_col is not None:
+                        include = self.parse_include(row[self.settings.include_col])
+                    expenses.append(Expense(date, concept, amount, include))
                 except (ValueError, IndexError):
                     continue
         return expenses
@@ -379,7 +410,12 @@ class CSVFileParser(FileParser):
         if not settings.loaded:
             settings.configure_rows(settings, rows)
         return FileSettings(
-            settings.date_col, settings.amount_col, settings.desc_col, settings.local_currency, settings.has_title_row
+            settings.date_col,
+            settings.amount_col,
+            settings.desc_col,
+            settings.local_currency,
+            settings.has_title_row,
+            settings.include_col,
         )
 
     def _detect_delimiter(self, file_path: str) -> str:
@@ -431,7 +467,7 @@ class EvoBankCSVFileParser(CSVFileParser):
         return Money(amount, self.settings.local_currency)
 
     def get_settings(self, settings, rows):
-        return FileSettings(3, 0, 2, Currency["EUR"], True)
+        return FileSettings(3, 0, 2, Currency["EUR"], True, None)
 
 
 class BankinterPDFParser(FileParser):
@@ -544,9 +580,12 @@ class SplitGenerator:
         print("Found {0} transactions".format(len(self.transactions)))
         for t in self.transactions:
             print(f"{t.date} {t.concept} ${t.amount}.")
-        i = 0
+        i = -1
         for t in self.transactions:
-            if self.options.yes:
+            i += 1
+            if t.include is False:
+                continue
+            if self.options.yes or (t.include is True):
                 # Ensure amount is positive before adding
                 t.amount = abs(t.amount)
                 self.splits.append(t)
@@ -558,8 +597,6 @@ class SplitGenerator:
             elif answer == "s":
                 print("Stopping selection early.")
                 break
-            # else: skip
-            i += 1
 
         print("-" * 40)
         print("Your Chosen Splits")
